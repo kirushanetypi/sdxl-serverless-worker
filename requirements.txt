@@ -1,0 +1,14 @@
+# Pinned so an image rebuild is reproducible. Every version below was verified
+# to exist on PyPI (see the task report); torch 2.5.1 ships CUDA 12.4 kernels on
+# PyPI, matching the cuda:12.4.1 runtime base image.
+torch==2.5.1
+torchvision==0.20.1
+diffusers==0.31.0
+transformers==4.46.3
+accelerate==1.1.1
+safetensors==0.4.5
+peft==0.13.2
+huggingface_hub==0.26.2
+hf_transfer==0.1.8
+runpod==1.7.0
+Pillow==10.4.0

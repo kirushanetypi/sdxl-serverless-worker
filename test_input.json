@@ -1,0 +1,12 @@
+{
+  "input": {
+    "prompt": "a red apple on a wooden table, soft daylight, product photo",
+    "negative_prompt": "blurry, low quality",
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance": 6.5,
+    "seed": 1234,
+    "sampler": "auto"
+  }
+}
