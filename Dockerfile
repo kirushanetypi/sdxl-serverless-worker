@@ -43,7 +43,7 @@ ENV MODEL_ROOT=/runpod-volume/models \
     HF_HOME=/tmp/hf-home \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     DEFAULT_STEPS=30 \
-    MAX_CACHED_PIPELINES=2 \
+    MAX_CACHED_PIPELINES=1 \
     ALLOW_DOWNLOAD=1
 
 CMD ["python3", "-u", "/app/handler.py"]

@@ -8,7 +8,12 @@ LoRA. This image owns the pipeline instead:
   * any SDXL-family checkpoint: a diffusers repo, a single-file
     ``.safetensors`` (``repo::file``), a direct URL, or a path on the volume;
   * models live on a network volume and are fetched on first use
-    (cache-on-first-use), never re-downloaded;
+    (cache-on-first-use), never re-downloaded; a checkpoint RunPod has preloaded
+    on the host is preferred over the volume copy;
+  * one checkpoint in VRAM at a time: switching models releases the previous
+    pipeline (``del`` + ``gc.collect()`` + ``torch.cuda.empty_cache()``) before
+    the next one is allocated, and ``meta`` reports the VRAM in use so leaks are
+    visible from a job response;
   * LoRA support, selectable sampler, ``clip_skip``, optional external VAE;
   * the response carries ``meta`` with the GPU name and the real timings.
 
@@ -32,6 +37,7 @@ sends) and the legacy ``refiner_inference_steps``/``high_noise_frac`` keys are
 still accepted.
 """
 import base64
+import gc
 import importlib
 import io
 import logging
@@ -69,7 +75,7 @@ LORA_SCALE = clamp_float(os.environ.get("LORA_SCALE"), 1.0, 0.0, 2.0)
 DEFAULT_STEPS_ENV = clamp_int(os.environ.get("DEFAULT_STEPS"), DEFAULT_STEPS, 1, 60)
 DEFAULT_SIZE_ENV = clamp_int(os.environ.get("DEFAULT_SIZE"), DEFAULT_SIZE, 256, 1536)
 DEFAULT_GUIDANCE_ENV = clamp_float(os.environ.get("DEFAULT_GUIDANCE"), DEFAULT_GUIDANCE, 0.0, 20.0)
-MAX_CACHED_PIPELINES = clamp_int(os.environ.get("MAX_CACHED_PIPELINES"), 2, 1, 4)
+MAX_CACHED_PIPELINES = clamp_int(os.environ.get("MAX_CACHED_PIPELINES"), 1, 1, 4)
 ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") not in ("0", "false", "False")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 MODEL_ROOT = resolve_root()
@@ -77,6 +83,9 @@ MODEL_ROOT = resolve_root()
 #: model reference -> {"pipe", "load_seconds", "model", "model_path", "model_type"}
 _PIPELINES = {}
 _PIPELINE_ORDER = []
+
+#: counters surfaced in ``meta`` so VRAM pressure is visible from a job response.
+_GPU_STATS = {"evictions": 0, "last_unload_allocated_gb": None}
 
 
 def _log_preflight():
@@ -94,6 +103,67 @@ def _log_preflight():
 # --------------------------------------------------------------------------- #
 # pipeline loading
 # --------------------------------------------------------------------------- #
+def _gpu_memory():
+    """(allocated_gb, reserved_gb) for the current process, or (None, None)."""
+    if not torch.cuda.is_available():
+        return None, None
+    try:
+        return (round(torch.cuda.memory_allocated() / 1024 ** 3, 2),
+                round(torch.cuda.memory_reserved() / 1024 ** 3, 2))
+    except Exception:  # noqa: BLE001 - instrumentation must never kill a job
+        return None, None
+
+
+def _detach_from_gpu(pipe):
+    """Stop ``pipe`` from holding CUDA storage; returns the device it moved to.
+
+    ``meta`` first because it drops the storage outright (no copy, no host RAM);
+    ``cpu`` is the fallback for modules that reject meta tensors. Moving the
+    modules away is what makes the free reliable even if some other object still
+    references the pipeline.
+    """
+    for target in ("meta", "cpu"):
+        try:
+            pipe.to(target)
+            return target
+        except Exception as exc:  # noqa: BLE001 - best effort, not fatal
+            log.warning("pipeline.to(%r) failed while unloading: %r", target, exc)
+    return None
+
+
+def release_pipeline(entry):
+    """Free a cached pipeline's VRAM *before* the next model is loaded.
+
+    Evicting from ``_PIPELINES`` alone is not enough: the object stays alive
+    until the local reference dies, so the ``torch.cuda.empty_cache()`` that used
+    to run here reclaimed nothing and the next checkpoint was loaded on top of
+    the previous one's weights. Measured on both a 20 GiB and a 24 GiB card
+    (kanban t_06eb5e83): allocated VRAM crept 10.1 -> 12.7 -> 14.9 -> 17.2 ->
+    20.1 GiB across a 4-model matrix and the next load died with
+    ``torch.OutOfMemoryError`` right after the model switch.
+
+    Returns the allocated VRAM (GiB) still held after the release, which is
+    reported in ``meta`` so the actual consumption is visible per job.
+    """
+    pipe = entry.pop("pipe", None) if isinstance(entry, dict) else entry
+    if pipe is not None:
+        device = _detach_from_gpu(pipe)
+        del pipe
+        log.info("released pipeline (moved to %s)", device)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:  # noqa: BLE001 - not available on every driver
+            pass
+    allocated, reserved = _gpu_memory()
+    _GPU_STATS["evictions"] += 1
+    _GPU_STATS["last_unload_allocated_gb"] = allocated
+    log.info("VRAM after unload: allocated=%s GiB reserved=%s GiB", allocated, reserved)
+    return allocated
+
+
 def _model_info(model_ref):
     info = ensure(model_ref, root=MODEL_ROOT, kind_hint="checkpoints",
                   allow_download=ALLOW_DOWNLOAD, token=HF_TOKEN)
@@ -134,6 +204,7 @@ def _apply_vae(pipe, vae_ref):
 def _build_pipeline(model_ref, vae_ref, loras):
     """Load a pipeline from a *local* path produced by the model store."""
     model = _model_info(model_ref)
+    before_allocated, _before_reserved = _gpu_memory()
     t0 = time.time()
     if model["kind"] in ("hf_repo", "local_dir"):
         pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -150,6 +221,7 @@ def _build_pipeline(model_ref, vae_ref, loras):
     if hasattr(pipe, "enable_vae_slicing"):
         pipe.enable_vae_slicing()
 
+    after_allocated, _after_reserved = _gpu_memory()
     entry = {
         "pipe": pipe,
         "model": model_ref,
@@ -160,6 +232,10 @@ def _build_pipeline(model_ref, vae_ref, loras):
         "model_download_seconds": model["download_seconds"],
         "model_bytes": model["bytes"],
         "load_seconds": round(time.time() - t0, 2),
+        # VRAM in use right before this model was loaded (i.e. how much the
+        # previous one still held) and right after it landed on the GPU.
+        "gpu_mem_before_load_gb": before_allocated,
+        "gpu_mem_after_load_gb": after_allocated,
         "vae": None,
         "loras": [],
     }
@@ -191,15 +267,19 @@ def get_pipeline(model_ref, vae_ref, loras):
         entry = dict(_PIPELINES[key])
         entry["pipeline_reused"] = True
         return entry
+
+    # Evict BEFORE loading: the new checkpoint must not be allocated on top of
+    # whatever the previous model still holds in VRAM (that is what produced
+    # torch.OutOfMemoryError on model switches - see release_pipeline).
+    while _PIPELINE_ORDER and len(_PIPELINE_ORDER) >= MAX_CACHED_PIPELINES:
+        old = _PIPELINE_ORDER.pop(0)
+        release_pipeline(_PIPELINES.pop(old, {}) or {})
+        log.info("evicted pipeline from cache: %s", old[0])
+
     entry = _build_pipeline(model_ref, vae_ref, loras)
     entry["pipeline_reused"] = False
     _PIPELINES[key] = entry
     _PIPELINE_ORDER.append(key)
-    while len(_PIPELINE_ORDER) > MAX_CACHED_PIPELINES:
-        old = _PIPELINE_ORDER.pop(0)
-        _PIPELINES.pop(old, None)
-        torch.cuda.empty_cache()
-        log.info("evicted pipeline from cache: %s", old[0])
     return dict(entry)
 
 
@@ -365,6 +445,7 @@ def handler(job):
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     gpu_total = (torch.cuda.get_device_properties(0).total_memory / 1024**3
                  if torch.cuda.is_available() else 0)
+    allocated_gb, reserved_gb = _gpu_memory()
     meta = {
         "model": req["model"],
         "model_type": entry.get("model_type"),
@@ -374,6 +455,12 @@ def handler(job):
         "model_download_seconds": entry.get("model_download_seconds"),
         "pipeline_load_seconds": entry.get("load_seconds"),
         "pipeline_reused": entry.get("pipeline_reused"),
+        "max_cached_pipelines": MAX_CACHED_PIPELINES,
+        "pipelines_evicted": _GPU_STATS["evictions"],
+        "gpu_mem_before_load_gb": entry.get("gpu_mem_before_load_gb"),
+        "gpu_mem_after_load_gb": entry.get("gpu_mem_after_load_gb"),
+        "gpu_memory_allocated_gb": allocated_gb,
+        "gpu_memory_reserved_gb": reserved_gb,
         "vae": entry.get("vae"),
         "loras": entry.get("loras") or [],
         "loras_from_env": entry.get("loras_from_env", False),
@@ -391,6 +478,8 @@ def handler(job):
         "image_bytes": len(png),
         "volume_available": volume_available(),
         "model_root": MODEL_ROOT,
+        "host_cache_root": HF_CACHE_ROOT,
+        "host_cache_repos": host_cache_repos(),
     }
     log.info("done: %s %ss (gen %ss, load %ss, cached=%s) seed=%s",
              req["model"], meta["request_seconds"], generation_seconds,

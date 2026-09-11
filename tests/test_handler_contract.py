@@ -30,6 +30,7 @@ class _FakePipe:
     def __init__(self):
         self.calls = []
         self.images = [_FakeImage()]
+        self.moved_to = []
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -37,6 +38,10 @@ class _FakePipe:
 
     def encode_prompt(self, *args, **kwargs):
         return ("default-encode",)
+
+    def to(self, device, *_args, **_kwargs):
+        self.moved_to.append(device)
+        return self
 
 
 class _FakeGenerator:
@@ -53,6 +58,9 @@ def _install_stubs():
     torch = types.ModuleType("torch")
 
     class _Cuda:
+        #: fake VRAM accounting, in bytes - handlers read this back into meta
+        allocated = 7 * 1024 ** 3
+
         @staticmethod
         def is_available():
             return True
@@ -67,6 +75,16 @@ def _install_stubs():
 
         @staticmethod
         def empty_cache():
+            _Cuda.allocated = 0
+
+        def memory_allocated(self):
+            return _Cuda.allocated
+
+        def memory_reserved(self):
+            return _Cuda.allocated
+
+        @staticmethod
+        def ipc_collect():
             return None
 
     torch.cuda = _Cuda()
@@ -94,6 +112,7 @@ def worker():
     handler = importlib.import_module("handler")
     handler._PIPELINES.clear()
     handler._PIPELINE_ORDER.clear()
+    handler._GPU_STATS.update({"evictions": 0, "last_unload_allocated_gb": None})
     built = []
 
     def fake_build(model_ref, vae_ref, loras):
@@ -196,3 +215,100 @@ def test_clip_skip_override_is_installed_and_removed(worker):
     assert worker.apply_clip_skip(pipe, 2) is None
     assert "_clip_skip_original" not in pipe.__dict__
     assert getattr(pipe, "encode_prompt", None) == original
+
+
+# --------------------------------------------------------------------------- #
+# VRAM release on model switch (kanban t_06eb5e83)
+# --------------------------------------------------------------------------- #
+def _tracking_build(worker, events):
+    """Replacement for _build_pipeline that logs build/move ordering."""
+    first = worker._build_pipeline
+
+    def fake_build(model_ref, vae_ref, loras):
+        events.append(("build", model_ref))
+        entry = first(model_ref, vae_ref, loras)
+        entry["pipe"] = _TrackingPipe(events)
+        return entry
+
+    worker._build_pipeline = fake_build
+
+
+class _TrackingPipe(_FakePipe):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def to(self, device, *args, **kwargs):
+        self.events.append(("move", device))
+        return super().to(device, *args, **kwargs)
+
+
+def test_previous_pipeline_is_released_before_the_next_model_loads(worker):
+    events = []
+    _tracking_build(worker, events)
+    worker.MAX_CACHED_PIPELINES = 1
+
+    worker.handler({"input": {"prompt": "x", "model": "org/a"}})
+    out = worker.handler({"input": {"prompt": "x", "model": "org/b"}})
+
+    # the old pipeline is moved off the GPU *before* the new one is built
+    assert events == [("build", "org/a"), ("move", "meta"), ("build", "org/b")]
+    assert out["meta"]["pipelines_evicted"] == 1
+    assert out["meta"]["max_cached_pipelines"] == 1
+
+
+def test_model_switch_moves_pipeline_off_gpu_and_frees_it(worker):
+    worker.MAX_CACHED_PIPELINES = 1
+    worker.handler({"input": {"prompt": "x", "model": "org/a"}})
+    pipe_a = next(iter(worker._PIPELINES.values()))["pipe"]
+
+    out = worker.handler({"input": {"prompt": "x", "model": "org/b"}})
+
+    assert pipe_a.moved_to[-1] == "meta"          # VRAM handed back
+    assert len(worker._PIPELINES) == 1            # only the current model is held
+    assert out["meta"]["gpu_memory_allocated_gb"] == 0.0
+
+
+def test_a_b_a_switch_back_does_not_accumulate_vram(worker):
+    """The acceptance scenario: model A -> model B -> model A back-to-back."""
+    worker.MAX_CACHED_PIPELINES = 1
+    for name in ("org/a", "org/b", "org/a"):
+        worker.handler({"input": {"prompt": "x", "model": name}})
+
+    assert worker._built == ["org/a", "org/b", "org/a"]   # A was reloaded, not kept
+    assert len(worker._PIPELINES) == 1
+    assert worker._GPU_STATS["evictions"] == 2
+    assert worker._GPU_STATS["last_unload_allocated_gb"] == 0.0
+
+
+def test_reused_pipeline_is_never_released(worker):
+    worker.MAX_CACHED_PIPELINES = 1
+    worker.handler({"input": {"prompt": "one", "model": "org/a"}})
+    pipe_a = next(iter(worker._PIPELINES.values()))["pipe"]
+    worker.handler({"input": {"prompt": "two", "model": "org/a"}})
+
+    assert pipe_a.moved_to == []
+    assert worker._GPU_STATS["evictions"] == 0
+    assert worker._built == ["org/a"]
+
+
+def test_release_pipeline_survives_a_pipe_that_refuses_to_move(worker):
+    class _Stubborn(_FakePipe):
+        def to(self, device, *args, **kwargs):
+            raise RuntimeError("cannot move")
+
+    entry = {"pipe": _Stubborn()}
+    assert worker.release_pipeline(entry) == 0.0
+    assert "pipe" not in entry  # dropped anyway, VRAM still reclaimed
+
+
+def test_meta_reports_vram_and_host_cache_fields(worker):
+    out = worker.handler({"input": {"prompt": "x"}})
+    meta = out["meta"]
+    for key in ("gpu_memory_allocated_gb", "gpu_memory_reserved_gb",
+                "gpu_mem_before_load_gb", "gpu_mem_after_load_gb",
+                "pipelines_evicted", "max_cached_pipelines",
+                "host_cache_root", "host_cache_repos"):
+        assert key in meta, key
+    assert meta["host_cache_root"] == "/runpod-volume/huggingface-cache/hub"
+    assert json.dumps(meta)
