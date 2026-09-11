@@ -109,6 +109,8 @@ def _install_stubs():
     class _Cuda:
         #: fake VRAM accounting, in bytes - handlers read this back into meta
         allocated = 7 * 1024 ** 3
+        free = 20 * 1024 ** 3
+        total = 24 * 1024 ** 3
 
         @staticmethod
         def is_available():
@@ -131,6 +133,9 @@ def _install_stubs():
 
         def memory_reserved(self):
             return _Cuda.allocated
+
+        def mem_get_info(self):
+            return self.free, self.total
 
         @staticmethod
         def ipc_collect():
@@ -340,6 +345,37 @@ def test_reused_pipeline_is_never_released(worker):
     assert pipe_a.moved_to == []
     assert worker._GPU_STATS["evictions"] == 0
     assert worker._built == ["org/a"]
+
+
+def test_low_free_vram_overrides_the_pipeline_cache_limit(worker):
+    """The template env said MAX_CACHED_PIPELINES=2 on a 24 GB card - the free
+    VRAM check has to win, or the next load OOMs."""
+    worker.MAX_CACHED_PIPELINES = 2
+    worker.VRAM_HEADROOM_GB = 9.0
+    torch = sys.modules["torch"]
+    torch.cuda.free = 4 * 1024 ** 3          # not enough for another checkpoint
+
+    worker.handler({"input": {"prompt": "x", "model": "org/a"}})
+    worker.handler({"input": {"prompt": "x", "model": "org/b"}})
+
+    assert len(worker._PIPELINES) == 1       # the old pipeline was dropped anyway
+    assert worker._GPU_STATS["evictions"] == 1
+
+
+def test_plenty_of_free_vram_keeps_the_configured_cache(worker):
+    worker.MAX_CACHED_PIPELINES = 2
+    worker.VRAM_HEADROOM_GB = 9.0
+    torch = sys.modules["torch"]
+    torch.cuda.free = 20 * 1024 ** 3
+
+    for name in ("org/a", "org/b"):
+        worker.handler({"input": {"prompt": "x", "model": name}})
+    assert len(worker._PIPELINES) == 2
+    assert worker._GPU_STATS["evictions"] == 0
+
+    worker.handler({"input": {"prompt": "x", "model": "org/c"}})
+    assert len(worker._PIPELINES) == 2       # the configured limit still applies
+    assert worker._GPU_STATS["evictions"] == 1
 
 
 def test_release_pipeline_survives_a_pipe_that_refuses_to_move(worker):

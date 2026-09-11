@@ -77,6 +77,10 @@ DEFAULT_STEPS_ENV = clamp_int(os.environ.get("DEFAULT_STEPS"), DEFAULT_STEPS, 1,
 DEFAULT_SIZE_ENV = clamp_int(os.environ.get("DEFAULT_SIZE"), DEFAULT_SIZE, 256, 1536)
 DEFAULT_GUIDANCE_ENV = clamp_float(os.environ.get("DEFAULT_GUIDANCE"), DEFAULT_GUIDANCE, 0.0, 20.0)
 MAX_CACHED_PIPELINES = clamp_int(os.environ.get("MAX_CACHED_PIPELINES"), 1, 1, 4)
+#: A fresh fp16 SDXL checkpoint needs roughly this much VRAM (unet + text
+#: encoders) before activations. When less is free, every cached pipeline is
+#: released even if MAX_CACHED_PIPELINES would have kept one.
+VRAM_HEADROOM_GB = clamp_float(os.environ.get("VRAM_HEADROOM_GB"), 9.0, 1.0, 40.0)
 ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") not in ("0", "false", "False")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 MODEL_ROOT = resolve_root()
@@ -146,11 +150,12 @@ def release_pipeline(entry):
     Returns the allocated VRAM (GiB) still held after the release, which is
     reported in ``meta`` so the actual consumption is visible per job.
     """
+    name = entry.get("model") if isinstance(entry, dict) else None
     pipe = entry.pop("pipe", None) if isinstance(entry, dict) else entry
     if pipe is not None:
         device = _detach_from_gpu(pipe)
         del pipe
-        log.info("released pipeline (moved to %s)", device)
+        log.info("released pipeline %s (moved to %s)", name, device)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -163,6 +168,17 @@ def release_pipeline(entry):
     _GPU_STATS["last_unload_allocated_gb"] = allocated
     log.info("VRAM after unload: allocated=%s GiB reserved=%s GiB", allocated, reserved)
     return allocated
+
+
+def free_vram_gb():
+    """Free VRAM in GiB (``None`` without a GPU / on an old driver)."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free, _total = torch.cuda.mem_get_info()
+        return free / 1024 ** 3
+    except Exception:  # noqa: BLE001 - absence of the API is not a job error
+        return None
 
 
 def _model_info(model_ref):
@@ -328,10 +344,17 @@ def get_pipeline(model_ref, vae_ref, loras):
     # Evict BEFORE loading: the new checkpoint must not be allocated on top of
     # whatever the previous model still holds in VRAM (that is what produced
     # torch.OutOfMemoryError on model switches - see release_pipeline).
-    while _PIPELINE_ORDER and len(_PIPELINE_ORDER) >= MAX_CACHED_PIPELINES:
+    #
+    # MAX_CACHED_PIPELINES alone is not trusted: it comes from the endpoint
+    # template and has been set to 2 while the card could not hold two fp16 SDXL
+    # pipelines plus activations, so the free-VRAM check overrides it.
+    free = free_vram_gb()
+    while _PIPELINE_ORDER and (len(_PIPELINE_ORDER) >= MAX_CACHED_PIPELINES
+                               or (free is not None and free < VRAM_HEADROOM_GB)):
         old = _PIPELINE_ORDER.pop(0)
         release_pipeline(_PIPELINES.pop(old, {}) or {})
         log.info("evicted pipeline from cache: %s", old[0])
+        free = free_vram_gb()
 
     entry = _build_pipeline(model_ref, vae_ref, loras)
     entry["pipeline_reused"] = False
@@ -524,6 +547,7 @@ def handler(job):
     gpu_total = (torch.cuda.get_device_properties(0).total_memory / 1024**3
                  if torch.cuda.is_available() else 0)
     allocated_gb, reserved_gb = _gpu_memory()
+    free_gb = free_vram_gb()
     scheduler = getattr(pipe, "scheduler", None)
     meta = {
         "model": req["model"],
@@ -540,6 +564,8 @@ def handler(job):
         "gpu_mem_after_load_gb": entry.get("gpu_mem_after_load_gb"),
         "gpu_memory_allocated_gb": allocated_gb,
         "gpu_memory_reserved_gb": reserved_gb,
+        "gpu_memory_free_gb": round(free_gb, 2) if free_gb is not None else None,
+        "vram_headroom_gb": VRAM_HEADROOM_GB,
         "image_health": health,
         "vae": entry.get("vae"),
         "vae_requested": req["vae"] or None,
