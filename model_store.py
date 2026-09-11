@@ -13,6 +13,20 @@ deterministic local path, so "is it cached?" is just an ``os.path`` check and a
 half-finished download can never be mistaken for a cached one (downloads land in
 a temp dir and are moved into place atomically).
 
+Resolution order for an HF reference (kanban t_06eb5e83)::
+
+    1. RunPod's host model cache   <-> /runpod-volume/huggingface-cache/hub/...
+    2. this store on the volume    <-> /runpod-volume/models/...
+    3. download (first use only)
+
+Step 1 exists because RunPod's "Model caching" preloads one HF repo per endpoint
+onto the worker host and schedules workers on hosts that already hold it; that
+copy reads "significantly faster" than the same bytes streamed off a network
+volume, and the download time is not billed. A cached copy is only used when it
+is *complete* (model_index.json for a diffusers repo, plausible size for a
+weight file) - an empty or half-written cache directory falls through to step 2
+instead of producing a confusing diffusers error later.
+
 Network access is injected through ``downloader`` callables so the resolver
 logic stays testable without huggingface_hub installed.
 """
@@ -159,6 +173,90 @@ def is_cached(path, kind, min_bytes=MIN_SINGLE_FILE_BYTES):
 
 
 # --------------------------------------------------------------------------- #
+# RunPod host model cache ("Cached models" / Model caching)
+# --------------------------------------------------------------------------- #
+#: Where RunPod's model-caching feature exposes the preloaded repo inside the
+#: worker container. Same mount path as a network volume, Hugging Face hub cache
+#: layout, slashes in the repo id replaced by double dashes:
+#:   <root>/models--{org}--{name}/snapshots/{commit-hash}/
+HF_CACHE_ROOT = os.path.join(VOLUME_ROOT, "huggingface-cache", "hub")
+
+REFS_MAIN = "main"
+
+
+def hf_cache_model_dir(repo, cache_root=HF_CACHE_ROOT):
+    """Cache directory RunPod uses for ``repo`` (may not exist yet)."""
+    return os.path.join(cache_root, "models--" + (repo or "").replace("/", "--", 1))
+
+
+def hf_cache_candidates(repo, cache_root=HF_CACHE_ROOT):
+    """Snapshot dirs for ``repo`` in the host cache, most likely first.
+
+    ``refs/main`` names the commit the cache was primed from, so that snapshot
+    wins; any other snapshot found is a fallback (a cache primed off a branch
+    other than main, or a refs file that was not written).
+    """
+    model_dir = hf_cache_model_dir(repo, cache_root)
+    snapshots = os.path.join(model_dir, "snapshots")
+    if not os.path.isdir(snapshots):
+        return []
+    rev = ""
+    try:
+        with open(os.path.join(model_dir, "refs", REFS_MAIN), encoding="utf-8") as fh:
+            rev = fh.read().strip()
+    except OSError:
+        pass
+    try:
+        rest = sorted(name for name in os.listdir(snapshots) if name != rev)
+    except OSError:
+        rest = []
+    return [os.path.join(snapshots, name) for name in ([rev] if rev else []) + rest]
+
+
+def host_cache_lookup(ref, info=None, cache_root=HF_CACHE_ROOT,
+                      min_bytes=MIN_SINGLE_FILE_BYTES):
+    """Resolve ``ref`` from RunPod's preloaded host model cache.
+
+    Returns a store-style result dict (``source='host_cache'``) or ``None`` when
+    the ref is not cached on this host, or when the cached copy is incomplete.
+    Only HF references can be cached by RunPod, so anything else returns None.
+    """
+    try:
+        info = info or classify_ref(ref)
+    except ValueError:
+        return None
+    kind = info.get("kind")
+    if kind not in ("hf_repo", "hf_single_file"):
+        return None
+
+    for snapshot in hf_cache_candidates(info["repo"], cache_root):
+        if not os.path.isdir(snapshot):
+            continue
+        path = snapshot if kind == "hf_repo" else os.path.join(snapshot, info["filename"])
+        if not is_cached(path, kind, min_bytes):
+            continue
+        return {"ref": ref, "kind": kind, "path": path, "cached": True,
+                "source": "host_cache", "download_seconds": 0.0,
+                "bytes": None if kind == "hf_repo" else os.path.getsize(path),
+                "error": None}
+    return None
+
+
+def host_cache_repos(cache_root=HF_CACHE_ROOT):
+    """Repo ids RunPod has preloaded on this host (``[]`` when there are none).
+
+    Reported in the job metadata so a cold-start measurement can prove the
+    worker really read the host cache and not the network volume.
+    """
+    try:
+        names = os.listdir(cache_root)
+    except OSError:
+        return []
+    return sorted(name[len("models--"):].replace("--", "/", 1)
+                  for name in names if name.startswith("models--"))
+
+
+# --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
 def load_registry(path):
@@ -229,42 +327,53 @@ def default_url_download(url, dest, token=None):
 
 def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
            snapshot_download=None, file_download=None, url_download=None,
-           registry_path=None, min_bytes=MIN_SINGLE_FILE_BYTES):
+           registry_path=None, min_bytes=MIN_SINGLE_FILE_BYTES,
+           cache_root=HF_CACHE_ROOT, use_host_cache=True):
     """Make sure ``ref`` exists locally, downloading it on first use.
+
+    Lookup order for an HF reference: RunPod's preloaded host cache, then this
+    store on the volume, then a download.
 
     Returns a dict::
 
-        {"ref", "kind", "path", "cached": bool, "download_seconds": float|None,
-         "bytes": int|None, "error": str|None}
+        {"ref", "kind", "path", "cached": bool, "source": str|None,
+         "download_seconds": float|None, "bytes": int|None, "error": str|None}
 
-    ``cached=True`` means it was already on the volume (no download, no billing
-    for the transfer). A download failure is reported, not raised, so the caller
-    can turn it into a proper RunPod job error.
+    ``source`` is ``host_cache`` | ``volume`` | ``download`` | ``local`` | None.
+    ``cached=True`` means nothing was downloaded on this call (no transfer was
+    billed). A download failure is reported, not raised, so the caller can turn
+    it into a proper RunPod job error.
     """
     root = root or resolve_root()
     try:
         info = classify_ref(ref)
     except ValueError as exc:
-        return {"ref": ref, "kind": None, "path": None, "cached": False,
+        return {"ref": ref, "kind": None, "path": None, "cached": False, "source": None,
                 "download_seconds": None, "bytes": None, "error": str(exc)}
 
     kind = info["kind"]
     if kind in ("local_dir", "local_file"):
         ok = is_cached(info["path"], kind, min_bytes)
         return {"ref": ref, "kind": kind, "path": info["path"] if ok else None,
-                "cached": ok, "download_seconds": 0.0 if ok else None,
+                "cached": ok, "source": "local" if ok else None,
+                "download_seconds": 0.0 if ok else None,
                 "bytes": os.path.getsize(info["path"]) if (ok and kind == "local_file") else None,
                 "error": None if ok else "local path is not a usable model: %s" % info["path"]}
+
+    if use_host_cache:
+        hit = host_cache_lookup(ref, info=info, cache_root=cache_root, min_bytes=min_bytes)
+        if hit:
+            return hit
 
     paths = ensure_dirs(root)
     dest = local_path_for(ref, root=root, kind_hint=kind_hint, info=info)
     if is_cached(dest, kind, min_bytes):
         size = None if kind == "hf_repo" else os.path.getsize(dest)
-        return {"ref": ref, "kind": kind, "path": dest, "cached": True,
+        return {"ref": ref, "kind": kind, "path": dest, "cached": True, "source": "volume",
                 "download_seconds": 0.0, "bytes": size, "error": None}
 
     if not allow_download:
-        return {"ref": ref, "kind": kind, "path": None, "cached": False,
+        return {"ref": ref, "kind": kind, "path": None, "cached": False, "source": None,
                 "download_seconds": None, "bytes": None,
                 "error": "not cached and downloads are disabled"}
 
@@ -282,12 +391,12 @@ def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
         else:
             url_download(info["url"], dest, token)
     except Exception as exc:  # noqa: BLE001 - reported to the caller as job error
-        return {"ref": ref, "kind": kind, "path": None, "cached": False,
+        return {"ref": ref, "kind": kind, "path": None, "cached": False, "source": None,
                 "download_seconds": round(time.time() - t0, 2), "bytes": None,
                 "error": "download failed: %r" % (exc,)}
 
     if not is_cached(dest, kind, min_bytes):
-        return {"ref": ref, "kind": kind, "path": None, "cached": False,
+        return {"ref": ref, "kind": kind, "path": None, "cached": False, "source": None,
                 "download_seconds": round(time.time() - t0, 2), "bytes": None,
                 "error": "download finished but %s is not a usable model" % dest}
 
@@ -304,5 +413,5 @@ def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
     except OSError:
         pass  # bookkeeping is nice-to-have, never fatal
 
-    return {"ref": ref, "kind": kind, "path": dest, "cached": False,
+    return {"ref": ref, "kind": kind, "path": dest, "cached": False, "source": "download",
             "download_seconds": seconds, "bytes": size, "error": None}

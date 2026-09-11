@@ -17,10 +17,14 @@ Storage model (decided in kanban t_970eafc9, supersedes the earlier
   * cache-on-first-use: a model that is not on the volume yet is downloaded by
     the worker on the first request that asks for it and then reused forever.
 
-RunPod's own "Model Caching" feature is NOT used: it cannot be enabled through
-the REST API (no ``model`` field on Endpoint/EndpointUpdateInput) and it relies
-on ``HF_HOME=/runpod-volume/huggingface-cache``, which conflicts with the
-per-request checkpoint selection this worker needs.
+RunPod's own "Model Caching" (endpoint **Model** field, set through the console
+or ``runpodctl serverless update --model-reference``) is used *in addition*, for
+the single checkpoint that endpoint serves most: the preloaded copy on the
+worker host is preferred by ``model_store.ensure`` when it is complete, because
+it reads much faster than the same bytes streamed off a network volume and the
+download itself is not billed. It does not replace the volume store - the cache
+holds exactly one repo per endpoint, so every other checkpoint still comes from
+``/runpod-volume/models``.
 """
 import os
 

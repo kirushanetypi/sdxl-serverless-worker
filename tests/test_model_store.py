@@ -13,9 +13,14 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_store import (  # noqa: E402
+    HF_CACHE_ROOT,
     classify_ref,
     ensure,
     ensure_dirs,
+    hf_cache_candidates,
+    hf_cache_model_dir,
+    host_cache_lookup,
+    host_cache_repos,
     is_cached,
     load_registry,
     local_path_for,
@@ -234,3 +239,152 @@ def test_ensure_dirs_creates_the_expected_layout(tmp_path):
     for key in ("checkpoints", "loras", "vae"):
         assert os.path.isdir(paths[key])
     json.dumps(paths)  # the returned dict must stay JSON-friendly for logging
+
+
+# --------------------------------------------------------------------------- #
+# RunPod host model cache (kanban t_06eb5e83)
+# --------------------------------------------------------------------------- #
+def _prime_host_cache(cache_root, repo, files=("model_index.json",), rev="abc123",
+                      write_ref=True, size=64):
+    """Build a RunPod-style host cache entry; returns (snapshot_dir)."""
+    org, name = repo.split("/", 1)
+    model_dir = os.path.join(str(cache_root), "models--%s--%s" % (org, name))
+    snap = os.path.join(model_dir, "snapshots", rev)
+    os.makedirs(snap, exist_ok=True)
+    for name_ in files:
+        path = os.path.join(snap, name_)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"{}" if name_.endswith(".json") else b"0" * size)
+    if write_ref:
+        os.makedirs(os.path.join(model_dir, "refs"), exist_ok=True)
+        with open(os.path.join(model_dir, "refs", "main"), "w", encoding="utf-8") as fh:
+            fh.write(rev)
+    return snap
+
+
+def test_host_cache_layout_matches_runpod_docs(tmp_path):
+    cache = tmp_path / "hf-cache"
+    assert hf_cache_model_dir("John6666/wai-nsfw-illustrious-sdxl-v150-sdxl", str(cache)) == os.path.join(
+        str(cache), "models--John6666--wai-nsfw-illustrious-sdxl-v150-sdxl")
+    assert HF_CACHE_ROOT == "/runpod-volume/huggingface-cache/hub"
+
+
+def test_host_cache_candidates_prefer_refs_main(tmp_path):
+    cache = tmp_path / "hf-cache"
+    _prime_host_cache(cache, "org/repo", rev="bbbb", write_ref=False)
+    _prime_host_cache(cache, "org/repo", rev="aaaa", write_ref=False)
+    got = hf_cache_candidates("org/repo", str(cache))
+    assert [os.path.basename(p) for p in got] == ["aaaa", "bbbb"]  # sorted fallback
+    main = _prime_host_cache(cache, "org/repo", rev="cccc")
+    assert hf_cache_candidates("org/repo", str(cache))[0] == main
+
+
+def test_host_cache_candidates_absent_or_broken(tmp_path):
+    cache = str(tmp_path / "hf-cache")
+    assert hf_cache_candidates("org/repo", cache) == []  # nothing at all
+    os.makedirs(os.path.join(cache, "models--org--repo"))  # no snapshots/ dir
+    assert hf_cache_candidates("org/repo", cache) == []
+
+
+def test_ensure_prefers_complete_host_cache_over_download(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    snap = _prime_host_cache(cache, "org/repo")
+    downloads = []
+
+    def snapshot_download(repo, dest, token=None):
+        downloads.append(repo)
+        return _fake_snapshot(repo, dest, token)
+
+    got = ensure("org/repo", root=root, snapshot_download=snapshot_download,
+                 cache_root=str(cache))
+    assert got["path"] == snap
+    assert got["source"] == "host_cache"
+    assert got["cached"] is True
+    assert got["download_seconds"] == 0.0
+    assert downloads == []  # nothing was fetched
+
+
+def test_ensure_ignores_incomplete_host_cache_and_falls_through(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    snap = _prime_host_cache(cache, "org/repo", files=())  # dir exists, empty
+    assert os.path.isdir(snap)
+
+    got = ensure("org/repo", root=root, snapshot_download=_fake_snapshot,
+                 cache_root=str(cache))
+    assert got["source"] == "download"
+    assert got["path"] == os.path.join(root, "checkpoints", "org--repo")
+
+
+def test_ensure_ignores_host_cache_with_dangling_refs_main(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    _prime_host_cache(cache, "org/repo", rev="real", write_ref=False)
+    model_dir = os.path.join(str(cache), "models--org--repo")
+    os.makedirs(os.path.join(model_dir, "refs"), exist_ok=True)
+    with open(os.path.join(model_dir, "refs", "main"), "w", encoding="utf-8") as fh:
+        fh.write("gone")  # hash without a snapshot directory
+
+    got = ensure("org/repo", root=root, snapshot_download=_fake_snapshot,
+                 cache_root=str(cache))
+    # the stale ref must not shadow the usable snapshot next to it
+    assert got["source"] == "host_cache"
+    assert os.path.basename(got["path"]) == "real"
+
+
+def test_ensure_prefers_host_cache_over_volume_copy(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    _fake_snapshot("org/repo", os.path.join(root, "checkpoints", "org--repo"))
+    snap = _prime_host_cache(cache, "org/repo")
+
+    got = ensure("org/repo", root=root, cache_root=str(cache))
+    assert got["path"] == snap and got["source"] == "host_cache"
+
+
+def test_ensure_host_cache_for_single_file_ref(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    snap = _prime_host_cache(cache, "org/repo", files=("model.safetensors",), size=64)
+    got = ensure("org/repo::model.safetensors", root=root, min_bytes=4,
+                 cache_root=str(cache))
+    assert got["path"] == os.path.join(snap, "model.safetensors")
+    assert got["source"] == "host_cache" and got["bytes"] == 64
+    # a tiny stub in the cache is not a usable checkpoint
+    tiny_cache = tmp_path / "tiny"
+    _prime_host_cache(tiny_cache, "org/repo", files=("model.safetensors",), size=8)
+    missed = host_cache_lookup("org/repo::model.safetensors", cache_root=str(tiny_cache))
+    assert missed is None
+
+
+def test_ensure_can_disable_host_cache_and_ignores_non_hf_refs(tmp_path):
+    root, cache = str(tmp_path / "store"), tmp_path / "hf-cache"
+    _prime_host_cache(cache, "org/repo")
+    off = ensure("org/repo", root=root, snapshot_download=_fake_snapshot,
+                 cache_root=str(cache), use_host_cache=False)
+    assert off["source"] == "download"
+
+    # URLs and volume paths are never served from the RunPod cache
+    assert host_cache_lookup("https://example.com/x.safetensors", cache_root=str(cache)) is None
+    assert host_cache_lookup("/runpod-volume/models/checkpoints/x.safetensors",
+                             cache_root=str(cache)) is None
+    assert host_cache_lookup("not a ref", cache_root=str(cache)) is None
+
+
+def test_host_cache_repos_lists_preloaded_models(tmp_path):
+    cache = tmp_path / "hf-cache"
+    assert host_cache_repos(str(cache)) == []  # missing root is not an error
+    _prime_host_cache(cache, "John6666/wai-nsfw-illustrious-sdxl-v150-sdxl")
+    _prime_host_cache(cache, "org/other")
+    assert host_cache_repos(str(cache)) == [
+        "John6666/wai-nsfw-illustrious-sdxl-v150-sdxl", "org/other"]
+
+
+def test_ensure_source_field_is_reported_for_every_path(tmp_path):
+    root, cache = str(tmp_path / "store"), str(tmp_path / "hf-cache")
+    assert ensure("justaname", root=root, cache_root=cache)["source"] is None
+    assert ensure("org/repo", root=root, snapshot_download=_fake_snapshot,
+                  cache_root=cache)["source"] == "download"
+    _fake_snapshot("org/repo", os.path.join(root, "checkpoints", "org--repo"))
+    assert ensure("org/repo", root=root, cache_root=cache)["source"] == "volume"
+    d = tmp_path / "local"
+    d.mkdir()
+    (d / "model_index.json").write_text("{}")
+    assert ensure(str(d), root=root, cache_root=cache)["source"] == "local"

@@ -44,7 +44,7 @@ import runpod
 import torch
 from diffusers import AutoencoderKL, StableDiffusionXLPipeline
 
-from model_store import ensure, resolve_root, volume_available
+from model_store import HF_CACHE_ROOT, ensure, host_cache_repos, resolve_root, volume_available
 from pipeline_utils import (
     DEFAULT_GUIDANCE,
     DEFAULT_MODEL_ID,
@@ -86,6 +86,7 @@ def _log_preflight():
         torch.cuda.is_available(),
         torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     )
+    log.info("host model cache: root=%s repos=%s", HF_CACHE_ROOT, host_cache_repos())
     if MODEL_ID:
         log.info("default MODEL_ID=%s", MODEL_ID)
 
@@ -154,6 +155,7 @@ def _build_pipeline(model_ref, vae_ref, loras):
         "model": model_ref,
         "model_path": model["path"],
         "model_type": model["kind"],
+        "model_source": model.get("source"),
         "model_cached": model["cached"],
         "model_download_seconds": model["download_seconds"],
         "model_bytes": model["bytes"],
@@ -367,6 +369,7 @@ def handler(job):
         "model": req["model"],
         "model_type": entry.get("model_type"),
         "model_path": entry.get("model_path"),
+        "model_source": entry.get("model_source"),
         "model_cached": entry.get("model_cached"),
         "model_download_seconds": entry.get("model_download_seconds"),
         "pipeline_load_seconds": entry.get("load_seconds"),
