@@ -22,8 +22,56 @@ sys.path.insert(0, os.path.dirname(HERE))
 # stub torch / diffusers / runpod
 # --------------------------------------------------------------------------- #
 class _FakeImage:
+    def __init__(self, pixels=None):
+        #: None -> a structured frame; pass a list of 0-255 ints for a specific one
+        self.pixels = pixels
+
     def save(self, buf, format="PNG", optimize=False):  # noqa: A002
         buf.write(b"\x89PNG\r\n\x1a\n" + format.encode())
+
+    # --- the frame-health path (convert -> resize -> tobytes) --------------- #
+    def convert(self, mode):  # noqa: ARG002
+        return self
+
+    def resize(self, size):  # noqa: ARG002
+        return self
+
+    def tobytes(self):
+        if self.pixels is not None:
+            return bytes(self.pixels)
+        return bytes((i // 8) % 256 for i in range(128 * 128))
+
+
+class _FakeScheduler:
+    pass
+
+
+class _FakeVAE:
+    config = types.SimpleNamespace(_name_or_path="stub-vae", force_upcast=True)
+
+    def __init__(self):
+        self.dtype = "float16"
+        self.device = None
+
+    def to(self, device):
+        self.device = device
+        return self
+
+
+class _FakeAutoencoderKL:
+    """Records how the VAE was loaded so the subfolder/kind logic is testable."""
+
+    calls = []
+
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        cls.calls.append(("from_pretrained", path, kwargs))
+        return _FakeVAE()
+
+    @classmethod
+    def from_single_file(cls, path, **kwargs):
+        cls.calls.append(("from_single_file", path, kwargs))
+        return _FakeVAE()
 
 
 class _FakePipe:
@@ -31,6 +79,7 @@ class _FakePipe:
         self.calls = []
         self.images = [_FakeImage()]
         self.moved_to = []
+        self.scheduler = _FakeScheduler()
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -95,7 +144,7 @@ def _install_stubs():
 
     diffusers = types.ModuleType("diffusers")
     diffusers.StableDiffusionXLPipeline = type("StableDiffusionXLPipeline", (), {})
-    diffusers.AutoencoderKL = type("AutoencoderKL", (), {})
+    diffusers.AutoencoderKL = _FakeAutoencoderKL
     sys.modules["diffusers"] = diffusers
 
     runpod = types.ModuleType("runpod")
@@ -113,6 +162,7 @@ def worker():
     handler._PIPELINES.clear()
     handler._PIPELINE_ORDER.clear()
     handler._GPU_STATS.update({"evictions": 0, "last_unload_allocated_gb": None})
+    _FakeAutoencoderKL.calls.clear()
     built = []
 
     def fake_build(model_ref, vae_ref, loras):
@@ -308,7 +358,125 @@ def test_meta_reports_vram_and_host_cache_fields(worker):
     for key in ("gpu_memory_allocated_gb", "gpu_memory_reserved_gb",
                 "gpu_mem_before_load_gb", "gpu_mem_after_load_gb",
                 "pipelines_evicted", "max_cached_pipelines",
-                "host_cache_root", "host_cache_repos"):
+                "host_cache_root", "host_cache_repos",
+                "image_health", "png_bytes_per_pixel", "scheduler",
+                "vae_requested", "vae_used"):
         assert key in meta, key
     assert meta["host_cache_root"] == "/runpod-volume/huggingface-cache/hub"
+    assert meta["scheduler"] == "_FakeScheduler"
     assert json.dumps(meta)
+
+
+# --------------------------------------------------------------------------- #
+# frame sanity check + VAE loading (kanban t_06eb5e83)
+# --------------------------------------------------------------------------- #
+def _build_with_pixels(worker, pixels):
+    first = worker._build_pipeline
+
+    def fake_build(model_ref, vae_ref, loras):
+        entry = first(model_ref, vae_ref, loras)
+        entry["pipe"].images = [_FakeImage(pixels=pixels)]
+        return entry
+
+    worker._build_pipeline = fake_build
+
+
+def test_noise_frame_is_flagged_in_meta(worker):
+    noise = [(i * 7919 + 13) % 256 for i in range(128 * 128)]
+    _build_with_pixels(worker, noise)
+    meta = worker.handler({"input": {"prompt": "x"}})["meta"]
+    assert meta["image_health"]["suspected_noise"] is True
+    assert meta["image_health"]["ok"] is False
+    assert meta["image_health"]["stddev"] >= 55
+
+
+def test_normal_frame_passes_the_sanity_check(worker):
+    meta = worker.handler({"input": {"prompt": "x"}})["meta"]
+    assert meta["image_health"]["ok"] is True
+    assert meta["image_health"]["suspected_noise"] is False
+    assert meta["image_health"]["unique_values"] > 1
+
+
+def test_vae_subfolder_detection(worker, tmp_path):
+    pipeline = tmp_path / "pipe"
+    (pipeline / "vae").mkdir(parents=True)
+    assert worker.vae_subfolder(str(pipeline)) == "vae"
+    bare = tmp_path / "bare-vae"
+    bare.mkdir()
+    assert worker.vae_subfolder(str(bare)) is None
+    assert worker.vae_subfolder(None) is None
+
+
+def _component_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text("{}")
+    (path / "diffusion_pytorch_model.safetensors").write_bytes(b"0" * 32)
+    return path
+
+
+def test_vae_from_a_pipeline_repo_uses_the_vae_subfolder(worker, tmp_path):
+    root = tmp_path / "models"
+    pipeline = root / "vae" / "org--pipe"
+    _component_dir(pipeline)
+    (pipeline / "model_index.json").write_text("{}")
+    _component_dir(pipeline / "vae")
+    worker.MODEL_ROOT = str(root)
+
+    entry = worker._apply_vae(_FakePipe(), "org/pipe")
+
+    assert entry["subfolder"] == "vae"
+    assert entry["class"] == "_FakeVAE" and entry["cached"] is True
+    assert _FakeAutoencoderKL.calls[-1] == (
+        "from_pretrained", str(pipeline), {"subfolder": "vae", "torch_dtype": "float16"})
+
+
+def test_vae_from_a_bare_repo_loads_without_a_subfolder(worker, tmp_path):
+    """stabilityai/sdxl-vae: config.json + weights at the root, no model_index.json."""
+    root = tmp_path / "models"
+    bare = _component_dir(root / "vae" / "stabilityai--sdxl-vae")
+    worker.MODEL_ROOT = str(root)
+
+    entry = worker._apply_vae(_FakePipe(), "stabilityai/sdxl-vae")
+
+    assert entry["subfolder"] is None and entry["cached"] is True
+    assert _FakeAutoencoderKL.calls[-1] == (
+        "from_pretrained", str(bare), {"subfolder": None, "torch_dtype": "float16"})
+
+
+def test_vae_from_a_local_safetensors_file(worker, tmp_path):
+    local = tmp_path / "my-vae.safetensors"
+    with open(local, "wb") as fh:
+        fh.truncate(101 * 1024 * 1024)  # sparse: passes the >=100 MB size check
+    worker.MODEL_ROOT = str(tmp_path / "models")
+
+    entry = worker._apply_vae(_FakePipe(), str(local))
+
+    assert entry["subfolder"] is None and entry["source"] == "local"
+    assert _FakeAutoencoderKL.calls[-1][0] == "from_single_file"
+
+
+def test_vae_description_reports_the_loaded_vae(worker):
+    pipe = _FakePipe()
+    pipe.vae = _FakeVAE()
+    got = worker._vae_description(pipe)
+    assert got["class"] == "_FakeVAE"
+    assert got["source"] == "stub-vae"
+    assert got["dtype"] == "float16"
+    assert worker._vae_description(object()) is None
+
+
+def test_fp16_unsafe_vae_is_forced_to_upcast(worker):
+    pipe = _FakePipe()
+    vae = _FakeVAE()
+    vae.config = types.SimpleNamespace(_name_or_path="mirror-vae", force_upcast=False)
+    pipe.vae = vae
+
+    note = worker._enforce_vae_upcast(pipe)
+    assert note and "force_upcast" in note
+    assert vae.config.force_upcast is True          # decoding now happens in fp32
+    assert worker._enforce_vae_upcast(pipe) is None  # idempotent
+    # an already-upcasting VAE (the default) is left alone
+    ok = _FakeVAE()
+    ok.config = types.SimpleNamespace(force_upcast=True)
+    assert worker._enforce_vae_upcast(types.SimpleNamespace(vae=ok)) is None
+    assert worker._enforce_vae_upcast(object()) is None

@@ -160,13 +160,38 @@ def local_path_for(ref, root=None, kind_hint=None, info=None):
     return os.path.join(subdir, filename if filename.lower().endswith(".safetensors") else slug + ".safetensors")
 
 
-def is_cached(path, kind, min_bytes=MIN_SINGLE_FILE_BYTES):
-    """A cached entry must be *complete*: a diffusers dir with model_index.json,
-    or a weight file of plausible size."""
+def is_component_dir(path):
+    """A diffusers *component* directory (a bare VAE repo, or a ``vae/`` subfolder
+    of a pipeline repo): a ``config.json`` next to some weights.
+
+    Standalone component repos such as ``stabilityai/sdxl-vae`` ship no
+    ``model_index.json``, so the pipeline check below rejected a perfectly good
+    VAE - the download succeeded and was then reported as "not a usable model"
+    (kanban t_06eb5e83).
+    """
+    if not path or not os.path.isfile(os.path.join(path, "config.json")):
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(name.endswith((".safetensors", ".bin")) for name in names)
+
+
+#: ``kind_hint`` values that name a pipeline component rather than a pipeline.
+COMPONENT_KINDS = ("vae",)
+
+
+def is_cached(path, kind, min_bytes=MIN_SINGLE_FILE_BYTES, kind_hint=None):
+    """A cached entry must be *complete*: a diffusers dir with model_index.json
+    (or ``config.json`` when the caller asked for a component), or a weight file
+    of plausible size."""
     if not path:
         return False
     if kind in ("hf_repo", "local_dir"):
-        return os.path.isfile(os.path.join(path, "model_index.json"))
+        if os.path.isfile(os.path.join(path, "model_index.json")):
+            return True
+        return (kind_hint or "").lower() in COMPONENT_KINDS and is_component_dir(path)
     if not os.path.isfile(path):
         return False
     return os.path.getsize(path) >= min_bytes
@@ -353,7 +378,7 @@ def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
 
     kind = info["kind"]
     if kind in ("local_dir", "local_file"):
-        ok = is_cached(info["path"], kind, min_bytes)
+        ok = is_cached(info["path"], kind, min_bytes, kind_hint=kind_hint)
         return {"ref": ref, "kind": kind, "path": info["path"] if ok else None,
                 "cached": ok, "source": "local" if ok else None,
                 "download_seconds": 0.0 if ok else None,
@@ -367,7 +392,7 @@ def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
 
     paths = ensure_dirs(root)
     dest = local_path_for(ref, root=root, kind_hint=kind_hint, info=info)
-    if is_cached(dest, kind, min_bytes):
+    if is_cached(dest, kind, min_bytes, kind_hint=kind_hint):
         size = None if kind == "hf_repo" else os.path.getsize(dest)
         return {"ref": ref, "kind": kind, "path": dest, "cached": True, "source": "volume",
                 "download_seconds": 0.0, "bytes": size, "error": None}
@@ -395,7 +420,7 @@ def ensure(ref, root=None, kind_hint=None, allow_download=True, token=None,
                 "download_seconds": round(time.time() - t0, 2), "bytes": None,
                 "error": "download failed: %r" % (exc,)}
 
-    if not is_cached(dest, kind, min_bytes):
+    if not is_cached(dest, kind, min_bytes, kind_hint=kind_hint):
         return {"ref": ref, "kind": kind, "path": None, "cached": False, "source": None,
                 "download_seconds": round(time.time() - t0, 2), "bytes": None,
                 "error": "download finished but %s is not a usable model" % dest}

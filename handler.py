@@ -60,6 +60,7 @@ from pipeline_utils import (
     DEFAULT_STEPS,
     clamp_float,
     clamp_int,
+    grey_health,
     parse_job_input,
     sampler_spec,
 )
@@ -187,18 +188,72 @@ def _load_lora(pipe, lora_ref, weight, adapter_name):
             "download_seconds": info["download_seconds"]}
 
 
+def vae_subfolder(path):
+    """``"vae"`` when ``path`` is a pipeline repo (its VAE lives in ./vae).
+
+    A bare VAE repo keeps config.json/weights at the root and must be loaded
+    without a subfolder; a full SDXL repo ships the same layout one level down.
+    """
+    if path and os.path.isdir(os.path.join(path, "vae")):
+        return "vae"
+    return None
+
+
 def _apply_vae(pipe, vae_ref):
     info = ensure(vae_ref, root=MODEL_ROOT, kind_hint="vae",
                   allow_download=ALLOW_DOWNLOAD, token=HF_TOKEN)
     if info.get("error"):
         raise RuntimeError("vae %s: %s" % (vae_ref, info["error"]))
     path = info["path"]
+    subfolder = None
     if os.path.isdir(path):
-        vae = AutoencoderKL.from_pretrained(path, torch_dtype=torch.float16)
+        subfolder = vae_subfolder(path)
+        vae = AutoencoderKL.from_pretrained(
+            path, subfolder=subfolder, torch_dtype=torch.float16)
     else:
         vae = AutoencoderKL.from_single_file(path, torch_dtype=torch.float16)
     pipe.vae = vae.to("cuda")
-    return {"ref": vae_ref, "path": path, "cached": info["cached"]}
+    return {"ref": vae_ref, "path": path, "cached": info["cached"],
+            "source": info.get("source"), "subfolder": subfolder,
+            "class": vae.__class__.__name__}
+
+
+def _enforce_vae_upcast(pipe):
+    """Make sure diffusers will upcast an fp16 VAE before decoding.
+
+    ``StableDiffusionXLPipeline.__call__`` only upcasts the VAE when
+    ``vae.config.force_upcast`` is true; a converted mirror can ship a VAE config
+    with it false, and an fp16 SDXL VAE then overflows into pure noise - a
+    "successful" job that returns a television-static PNG (kanban t_06eb5e83,
+    RealVisXL v5.0). The autoencoder's config default is True, so this only
+    intervenes on a config that explicitly disables it.
+    """
+    config = getattr(getattr(pipe, "vae", None), "config", None)
+    if config is None or getattr(config, "force_upcast", None) is not False:
+        return None
+    config.force_upcast = True
+    log.warning("VAE config had force_upcast=False; forcing it on "
+                "(fp16 VAE decode returns noise on some SDXL checkpoints)")
+    return "force_upcast=False overridden to True"
+
+
+def _vae_description(pipe):
+    """How the VAE actually in use was obtained, for the job metadata.
+
+    Reported on every response because a broken/mismatched VAE is the usual
+    cause of a "successful" request that returns pure noise (kanban t_06eb5e83),
+    and that is otherwise only visible by looking at the picture.
+    """
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        return None
+    config = getattr(vae, "config", None)
+    return {
+        "class": vae.__class__.__name__,
+        "dtype": str(getattr(vae, "dtype", "")),
+        "source": getattr(config, "_name_or_path", None) or "checkpoint (built in)",
+        "force_upcast": getattr(config, "force_upcast", None),
+    }
 
 
 def _build_pipeline(model_ref, vae_ref, loras):
@@ -242,6 +297,8 @@ def _build_pipeline(model_ref, vae_ref, loras):
 
     if vae_ref:
         entry["vae"] = _apply_vae(pipe, vae_ref)
+    entry["vae_upcast_note"] = _enforce_vae_upcast(pipe)
+    entry["vae_used"] = _vae_description(pipe)
 
     loras = list(loras)
     if not loras and LORA_ID and LORA_FILE:
@@ -286,6 +343,23 @@ def get_pipeline(model_ref, vae_ref, loras):
 # --------------------------------------------------------------------------- #
 # sampler / clip_skip
 # --------------------------------------------------------------------------- #
+#: Side of the greyscale thumbnail the noise/blank check runs on.
+HEALTH_THUMBNAIL = 128
+
+
+def _image_health(image):
+    """Signal statistics + noise/blank verdict for a generated frame.
+
+    Implemented as a thumbnail hand-off to ``pipeline_utils.grey_health`` so the
+    thresholds stay unit-testable without Pillow.
+    """
+    try:
+        grey = image.convert("L").resize((HEALTH_THUMBNAIL, HEALTH_THUMBNAIL))
+        return grey_health(grey.tobytes(), width=HEALTH_THUMBNAIL)
+    except Exception as exc:  # noqa: BLE001 - never fail a job over telemetry
+        return {"error": repr(exc), "ok": None, "suspected_noise": None}
+
+
 def apply_sampler(pipe, sampler_name):
     if not sampler_name or sampler_name == DEFAULT_SAMPLER:
         return None
@@ -442,10 +516,15 @@ def handler(job):
     result.images[0].save(buf, format="PNG", optimize=False)
     png = buf.getvalue()
 
+    health = _image_health(result.images[0])
+    if health.get("ok") is False:
+        log.warning("suspicious frame: %s", health)
+
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     gpu_total = (torch.cuda.get_device_properties(0).total_memory / 1024**3
                  if torch.cuda.is_available() else 0)
     allocated_gb, reserved_gb = _gpu_memory()
+    scheduler = getattr(pipe, "scheduler", None)
     meta = {
         "model": req["model"],
         "model_type": entry.get("model_type"),
@@ -461,7 +540,12 @@ def handler(job):
         "gpu_mem_after_load_gb": entry.get("gpu_mem_after_load_gb"),
         "gpu_memory_allocated_gb": allocated_gb,
         "gpu_memory_reserved_gb": reserved_gb,
+        "image_health": health,
         "vae": entry.get("vae"),
+        "vae_requested": req["vae"] or None,
+        "vae_used": entry.get("vae_used"),
+        "vae_upcast_note": entry.get("vae_upcast_note"),
+        "scheduler": scheduler.__class__.__name__ if scheduler is not None else None,
         "loras": entry.get("loras") or [],
         "loras_from_env": entry.get("loras_from_env", False),
         "gpu_name": gpu_name,
@@ -476,6 +560,7 @@ def handler(job):
         "clip_skip": req["clip_skip"],
         "seed": seed,
         "image_bytes": len(png),
+        "png_bytes_per_pixel": round(len(png) / max(1, req["width"] * req["height"]), 3),
         "volume_available": volume_available(),
         "model_root": MODEL_ROOT,
         "host_cache_root": HF_CACHE_ROOT,

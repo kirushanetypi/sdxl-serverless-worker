@@ -119,6 +119,52 @@ def align_to_8(value):
     return value - (value % 8)
 
 
+#: A generated frame is flagged when it is structurally noise rather than a
+#: picture. 8-bit white noise has stddev ~74 and a mean neighbour difference ~42
+#: (E|X-Y| = 2*sigma/sqrt(pi)); real anime/photographic frames sit far below both.
+#: Six of 24 matrix frames once came back as pure noise and only a human noticed
+#: (kanban t_06eb5e83), so the worker now reports this per response.
+NOISE_STDDEV_MIN = 55.0
+NOISE_NEIGHBOUR_DIFF_MIN = 30.0
+BLANK_STDDEV_MAX = 1.0
+
+
+def grey_health(pixels, width, min_stddev=NOISE_STDDEV_MIN,
+                min_neighbour_diff=NOISE_NEIGHBOUR_DIFF_MIN,
+                max_flat_stddev=BLANK_STDDEV_MAX):
+    """Signal statistics for a downscaled greyscale frame + a sanity verdict.
+
+    ``pixels`` is a flat row-major sequence of 0-255 values, ``width`` the row
+    length. Noise has no spatial structure, so it is detected without a model:
+    both its global spread and its pixel-to-pixel difference are huge, while a
+    flat (all-one-value) frame is the other classic broken-output signature.
+    """
+    px = [int(p) for p in pixels]
+    n = len(px)
+    if n == 0:
+        return {"pixels": 0, "mean": None, "stddev": None, "neighbour_diff": None,
+                "unique_values": 0, "suspected_noise": True, "suspected_blank": True,
+                "ok": False}
+    mean = sum(px) / n
+    variance = sum((p - mean) ** 2 for p in px) / n
+    stddev = variance ** 0.5
+    step = max(1, int(width))
+    diffs = [abs(px[i] - px[i - 1]) for i in range(1, n) if i % step]
+    neighbour_diff = (sum(diffs) / len(diffs)) if diffs else 0.0
+    suspected_noise = stddev >= min_stddev and neighbour_diff >= min_neighbour_diff
+    suspected_blank = stddev <= max_flat_stddev
+    return {
+        "pixels": n,
+        "mean": round(mean, 2),
+        "stddev": round(stddev, 2),
+        "neighbour_diff": round(neighbour_diff, 2),
+        "unique_values": len(set(px)),
+        "suspected_noise": suspected_noise,
+        "suspected_blank": suspected_blank,
+        "ok": not (suspected_noise or suspected_blank),
+    }
+
+
 def build_prompt(prompt, appearance="", style_positive="", quality_prefix=""):
     """Join optional prompt fragments in a stable order (empty parts dropped)."""
     parts = [quality_prefix or "", appearance or "", (prompt or "").strip(), style_positive or ""]

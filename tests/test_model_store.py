@@ -22,6 +22,7 @@ from model_store import (  # noqa: E402
     host_cache_lookup,
     host_cache_repos,
     is_cached,
+    is_component_dir,
     load_registry,
     local_path_for,
     resolve_root,
@@ -388,3 +389,85 @@ def test_ensure_source_field_is_reported_for_every_path(tmp_path):
     d.mkdir()
     (d / "model_index.json").write_text("{}")
     assert ensure(str(d), root=root, cache_root=cache)["source"] == "local"
+
+
+# --------------------------------------------------------------------------- #
+# standalone component repos (VAE) - kanban t_06eb5e83
+# --------------------------------------------------------------------------- #
+def _fake_component_dir(path, weights="diffusion_pytorch_model.safetensors"):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    if weights:
+        with open(os.path.join(path, weights), "wb") as fh:
+            fh.write(b"0" * 64)
+    return path
+
+
+def test_pipeline_check_still_rejects_a_component_dir_without_the_hint(tmp_path):
+    d = _fake_component_dir(str(tmp_path / "sdxl-vae"))
+    assert is_cached(d, "hf_repo") is False          # a checkpoint needs model_index.json
+    assert is_cached(d, "hf_repo", kind_hint="vae") is True
+
+
+def test_is_component_dir_requires_config_and_weights(tmp_path):
+    assert is_component_dir(None) is False
+    assert is_component_dir(str(tmp_path / "nope")) is False
+    bare = tmp_path / "bare-config"
+    bare.mkdir()
+    (bare / "config.json").write_text("{}")
+    assert is_component_dir(str(bare)) is False       # config without weights
+    assert is_component_dir(_fake_component_dir(str(tmp_path / "ok"))) is True
+    assert is_component_dir(_fake_component_dir(str(tmp_path / "bin"),
+                                                "diffusion_pytorch_model.bin")) is True
+
+
+def test_standalone_vae_repo_downloads_once_and_is_then_a_cache_hit(tmp_path):
+    """The reported bug: stabilityai/sdxl-vae downloaded, then was rejected as
+    'not a usable model' because it ships no model_index.json."""
+    root, cache = str(tmp_path / "store"), str(tmp_path / "hf-cache")
+    calls = []
+
+    def snapshot(repo, dest, token=None):
+        calls.append(repo)
+        _fake_component_dir(dest)
+        return dest
+
+    first = ensure("stabilityai/sdxl-vae", root=root, kind_hint="vae",
+                   snapshot_download=snapshot, cache_root=cache)
+    assert first["error"] is None
+    assert first["path"] == os.path.join(root, "vae", "stabilityai--sdxl-vae")
+    assert is_component_dir(first["path"]) is True
+
+    second = ensure("stabilityai/sdxl-vae", root=root, kind_hint="vae",
+                    snapshot_download=snapshot, cache_root=cache)
+    assert second["cached"] is True and second["source"] == "volume"
+    assert calls == ["stabilityai/sdxl-vae"]  # downloaded exactly once
+
+
+def test_vae_inside_a_pipeline_repo_and_a_local_vae_file(tmp_path):
+    """Variant 1: a full pipeline repo whose VAE lives in ./vae (skipped by the
+    store, resolved by the handler); variant 3: a local .safetensors VAE."""
+    root, cache = str(tmp_path / "store"), str(tmp_path / "hf-cache")
+    pipeline = _fake_snapshot("org/sdxl-pipe", os.path.join(root, "vae", "org--sdxl-pipe"))
+    _fake_component_dir(os.path.join(pipeline, "vae"))
+    got = ensure("org/sdxl-pipe", root=root, kind_hint="vae", cache_root=cache)
+    assert got["cached"] is True and got["source"] == "volume"
+    assert os.path.isdir(os.path.join(got["path"], "vae"))  # handler adds subfolder
+
+    local = tmp_path / "my-vae.safetensors"
+    local.write_bytes(b"0" * 64)
+    got_local = ensure(str(local), root=root, kind_hint="vae", min_bytes=4, cache_root=cache)
+    assert got_local["kind"] == "local_file" and got_local["path"] == str(local)
+    assert got_local["source"] == "local"
+
+
+def test_vae_download_that_is_not_a_component_reports_a_clear_error(tmp_path):
+    def junk(repo, dest, token=None):
+        os.makedirs(dest, exist_ok=True)  # neither model_index.json nor config.json
+        return dest
+
+    got = ensure("org/not-a-vae", root=str(tmp_path), kind_hint="vae",
+                 snapshot_download=junk, cache_root=str(tmp_path / "hf-cache"))
+    assert got["path"] is None
+    assert got["error"].startswith("download finished but")

@@ -15,10 +15,68 @@ from pipeline_utils import (  # noqa: E402
     build_prompt,
     clamp_float,
     clamp_int,
+    grey_health,
     parse_job_input,
     parse_loras,
     sampler_spec,
 )
+
+
+# --------------------------------------------------------------------------- #
+# generated-frame sanity check (kanban t_06eb5e83)
+# --------------------------------------------------------------------------- #
+def _noise_pixels(n=128 * 128, width=128, seed=7):
+    """Deterministic pseudo-noise, like a frame from a broken checkpoint/VAE."""
+    out = []
+    state = seed
+    for _ in range(n):
+        state = (1103515245 * state + 12345) % (2 ** 31)
+        out.append((state >> 16) % 256)
+    return out
+
+
+def _picture_pixels(n=128 * 128, width=128):
+    """A structured frame: smooth gradients and a few flat areas."""
+    out = []
+    for i in range(n):
+        row, col = divmod(i, width)
+        out.append((row * 2 + col // 8) % 256 if (row // 16 + col // 16) % 2 else 40)
+    return out
+
+
+def test_grey_health_flags_noise():
+    got = grey_health(_noise_pixels(), width=128)
+    assert got["suspected_noise"] is True
+    assert got["ok"] is False
+    assert got["stddev"] >= 55          # white noise is ~74
+    assert got["neighbour_diff"] >= 30  # ~42 for independent samples
+
+
+def test_grey_health_accepts_a_structured_frame():
+    got = grey_health(_picture_pixels(), width=128)
+    assert got["suspected_noise"] is False
+    assert got["ok"] is True
+    assert got["unique_values"] > 1
+
+
+def test_grey_health_flags_a_flat_frame_as_blank():
+    got = grey_health([0] * (128 * 128), width=128)
+    assert got["suspected_blank"] is True and got["ok"] is False
+    assert got["stddev"] == 0.0 and got["neighbour_diff"] == 0.0
+
+
+def test_grey_health_handles_empty_input():
+    got = grey_health([], width=128)
+    assert got["pixels"] == 0 and got["ok"] is False
+
+
+def test_grey_health_ignores_row_wraps_when_measuring_neighbours():
+    # a horizontal edge is structure: one big difference per row, not per pixel
+    width, height = 128, 128
+    got = grey_health([0 if (i % width) < width // 2 else 255
+                       for i in range(width * height)], width=width)
+    assert got["neighbour_diff"] == pytest.approx(255 / 127, abs=0.1)
+    assert got["suspected_noise"] is False
 
 
 def test_clamp_helpers():
