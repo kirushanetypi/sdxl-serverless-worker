@@ -1,0 +1,27 @@
+# comfyui-micro: только CUDA + Python + curl. Всё остальное onstart.sh.
+# Образ ~1.5 ГБ → Vast загружает за 30 сек (nvidia/cuda кеширован).
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+LABEL org.opencontainers.image.title="comfyui-micro" \
+      org.opencontainers.image.description="CUDA base only — ComfyUI + checkpoint download on start"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    COMFY_DIR=/opt/ComfyUI
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates curl git \
+        libgl1 libglib2.0-0 libgomp1 \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py \
+    && rm -f /tmp/get-pip.py
+
+WORKDIR /opt
+EXPOSE 8188
+CMD ["bash", "-c", "echo 'waiting for onstart.sh' && sleep infinity"]
