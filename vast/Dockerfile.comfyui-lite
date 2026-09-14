@@ -1,0 +1,44 @@
+# comfyui-lite: ComfyUI + CUDA + torch, БЕЗ чекпойнта.
+# Чекпойнт докачивается onstart.sh с HuggingFace.
+# Образ ~5-6 ГБ вместо 13 ГБ → Vast поднимает за 2-3 мин.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+LABEL org.opencontainers.image.title="comfyui-lite" \
+      org.opencontainers.image.description="ComfyUI without checkpoint — downloads on start"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    COMFY_DIR=/opt/ComfyUI
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates curl git git-lfs \
+        libgl1 libglib2.0-0 libgomp1 \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py \
+    && rm -f /tmp/get-pip.py \
+    && python3 -m pip install --upgrade pip setuptools wheel
+
+RUN python3 -m pip install --no-cache-dir \
+        torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && python3 -c "import torch; assert torch.__version__.startswith('2.11.0')"
+
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}" \
+    && python3 -m pip install --no-cache-dir -r "${COMFY_DIR}/requirements.txt" \
+    && python3 -c "import comfy_kitchen, comfy_aimdo" \
+    && cd "${COMFY_DIR}" && python3 -c "import comfy.utils"
+
+# Чекпойнт НЕ в образе — скачивается onstart.sh
+RUN mkdir -p "${COMFY_DIR}/models/checkpoints"
+
+WORKDIR ${COMFY_DIR}
+EXPOSE 8188
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch"]
