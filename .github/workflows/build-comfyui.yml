@@ -1,0 +1,106 @@
+name: build-comfyui-canon
+
+# Собирает образ ComfyUI с запечённым каноном (WAI NSFW Illustrious v1.5) и
+# публикует его в GHCR как ghcr.io/kirushanetypi/comfyui-canon:latest.
+#
+# Почему в CI, а не на VPS: на сервере занято 30 из 40 ГБ, а образ ~14 ГБ
+# (CUDA-база + torch cu124 + ComfyUI + 6.9 ГБ чекпойнт). Локальная сборка
+# уронила бы Hermes/Caddy — см. /root/vast/SPEC-vast.md.
+#
+# Отдельный файл от build.yml (там образ воркера RunPod) — чтобы не трогать
+# чужой пайплайн: этот прогон запускается только при изменениях в vast/**.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'vast/**'
+      - '.github/workflows/build-comfyui.yml'
+
+env:
+  IMAGE: ghcr.io/kirushanetypi/comfyui-canon
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Освобождаю диск (образ ~14 ГБ)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+                      /usr/local/.ghcup /usr/lib/jvm || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./vast
+          file: ./vast/Dockerfile.comfyui
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Размер образа и digest
+        run: |
+          echo "digest: ${{ steps.build.outputs.digest }}"
+          docker pull ${{ env.IMAGE }}:sha-${{ github.sha }} || true
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep comfyui-canon || true
+          df -h /
+
+      - name: Smoke test — ComfyUI стартует и канон на месте (CPU)
+        run: |
+          set -eux
+          IMG="${{ env.IMAGE }}:sha-${{ github.sha }}"
+          docker run -d --name comfy-smoke -p 8188:8188 --entrypoint python3 \
+            "$IMG" main.py --cpu --listen 0.0.0.0 --port 8188 --disable-auto-launch
+          docker cp vast/smoke_test.py comfy-smoke:/tmp/smoke_test.py
+          set +e
+          docker exec comfy-smoke python3 /tmp/smoke_test.py \
+            --base-url http://127.0.0.1:8188 \
+            --checkpoint-file /opt/ComfyUI/models/checkpoints/waiNSFWIllustrious_v150.safetensors \
+            --expected-bytes 6938040682 \
+            --expected-sha256 befc694a296f75e996488ebf9f9db8a1493bd059b6e704b975829e87d5aeb4fa \
+            --timeout 420
+          rc=$?
+          set -e
+          if [ "$rc" != "0" ]; then
+            echo "=== хвост лога ComfyUI ==="
+            docker logs --tail 200 comfy-smoke || true
+            exit "$rc"
+          fi
+
+      - name: Убираю контейнер
+        if: always()
+        run: docker rm -f comfy-smoke || true
+
+      - name: Итог
+        if: success()
+        run: |
+          echo "образ опубликован: ${{ env.IMAGE }}:latest"
+          echo "digest: ${{ steps.build.outputs.digest }}"
+          echo "проверка анонимного pull (вручную, без логина):"
+          echo "  curl -s 'https://ghcr.io/token?scope=repository:kirushanetypi/comfyui-canon:pull&service=ghcr.io'"

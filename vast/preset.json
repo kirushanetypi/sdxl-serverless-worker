@@ -1,0 +1,13 @@
+{
+  "label": "sasha-comfyui-embedded",
+  "gpu_filter": "RTX 3090,RTX 4090",
+  "min_disk_gb": 60,
+  "min_reliability": 0.95,
+  "max_price_per_hour": 0.2,
+  "image": "ghcr.io/kirushanetypi/comfyui-canon:latest",
+  "disk_gb": 64,
+  "ports": "8188:8188",
+  "onstart": "/root/vast/onstart.sh",
+  "checkpoint_embedded": true,
+  "note": "Образ ~14 ГБ (ComfyUI + torch cu124 + чекпойнт канона), Vast тянет его из GHCR"
+}

@@ -1,0 +1,96 @@
+# ComfyUI + наш канон (WAI NSFW Illustrious v1.5) внутри образа.
+#
+# Собирается ТОЛЬКО в GitHub Actions (.github/workflows/build-comfyui.yml) и
+# публикуется как ghcr.io/kirushanetypi/comfyui-canon:latest. На VPS сборку не
+# запускать: там занято 30 из 40 ГБ, образ ~14 ГБ машину уронит.
+#
+# Чем отличается от черновика (разбор — /root/vast/SPEC-vast.md):
+#  1. базовый образ nvidia/cuda runtime, а НЕ pytorch/pytorch (на нём ComfyUI
+#     падал с comfy_kitchen / infer_schema: list[int]);
+#  2. torch ставится ПЕРВЫМ и с пином (2.6.0 = CUDA 12.4), а не «что даст pip»;
+#  3. ComfyUI клонируется git-ом в /opt/ComfyUI + pip install -r его
+#     requirements.txt, а не ставится python-пакетом (иначе нет каталогов
+#     models/checkpoints и WORKDIR промахивается);
+#  4. чекпойнт качается одним файлом с HuggingFace по зафиксированному sha256
+#     и проверяется прямо в сборке (размер + хеш);
+#  5. в образ ничего не COPY-ится из контекста, кроме самого Dockerfile —
+#     запуск задаётся CMD (python3 main.py --listen 0.0.0.0 --port 8188).
+#
+# Проверка после сборки — vast/smoke_test.py (гоняется в CI на CPU).
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+LABEL org.opencontainers.image.title="comfyui-canon" \
+      org.opencontainers.image.description="ComfyUI with the embedded WAI NSFW Illustrious v1.5 canon checkpoint" \
+      org.opencontainers.image.source="https://github.com/kirushanetypi/sdxl-serverless-worker"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    COMFY_DIR=/opt/ComfyUI
+
+# --- python 3.11 (в jammy штатный 3.10; берем тот же deadsnakes, что и у воркера)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates curl git git-lfs \
+        libgl1 libglib2.0-0 libgomp1 \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py \
+    && rm -f /tmp/get-pip.py \
+    && python3 -m pip install --upgrade pip setuptools wheel \
+    && python3 -VV
+
+# --- torch первым и с пином: 2.6.0 = CUDA 12.4, ровно то, что в базовом образе
+RUN python3 -m pip install --no-cache-dir \
+        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+        --index-url https://download.pytorch.org/whl/cu124 \
+    && python3 -c "import torch; assert torch.__version__.startswith('2.6.0'), torch.__version__; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# --- ComfyUI: git clone + его собственные requirements
+# В requirements.txt ComfyUI torch не запинен, а уже установленный 2.6.0 это
+# требование удовлетворяет — проверяем, что pip его не подменил.
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}" \
+    && python3 -m pip install --no-cache-dir -r "${COMFY_DIR}/requirements.txt" \
+    && python3 -c "import torch; assert torch.__version__.startswith('2.6.0'), 'pip подменил torch на ' + torch.__version__; print('torch после requirements:', torch.__version__)"
+
+# --- канон: один файл .safetensors, sha256 и размер зафиксированы
+# Источник — Civitai-релиз v15.0 в single-file виде, поднятый на HF. Один и тот
+# же файл лежит в трёх независимых зеркалах (LarryAIDraw, msagi, zhenshipo) с
+# идентичным sha256; берём первые два и падаем, если ни один не сошёлся.
+ARG CKPT_FILENAME=waiNSFWIllustrious_v150.safetensors
+ARG CKPT_SHA256=befc694a296f75e996488ebf9f9db8a1493bd059b6e704b975829e87d5aeb4fa
+ARG CKPT_BYTES=6938040682
+RUN set -eux; \
+    dest="${COMFY_DIR}/models/checkpoints/${CKPT_FILENAME}"; \
+    mkdir -p "${COMFY_DIR}/models/checkpoints"; \
+    ok=0; \
+    for url in \
+        "https://huggingface.co/LarryAIDraw/waiNSFWIllustrious_v150/resolve/main/${CKPT_FILENAME}" \
+        "https://huggingface.co/msagi/waiNSFWIllustrious_v150/resolve/main/${CKPT_FILENAME}" \
+    ; do \
+        echo "==> качаю ${url}"; \
+        if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "${dest}" "${url}?download=true"; then \
+            if echo "${CKPT_SHA256}  ${dest}" | sha256sum -c -; then ok=1; break; fi; \
+            echo "!! sha256 не сошёлся, пробую следующее зеркало"; \
+        fi; \
+        rm -f "${dest}"; \
+    done; \
+    [ "${ok}" = "1" ] || { echo "!! ни одно зеркало чекпойнта не отдало верный файл"; exit 1; }; \
+    size="$(stat -c %s "${dest}")"; \
+    [ "${size}" = "${CKPT_BYTES}" ] || { echo "!! размер ${size} != ${CKPT_BYTES}"; exit 1; }; \
+    rm -rf "${COMFY_DIR}/.git"; \
+    echo "checkpoint ok: ${dest}, ${size} bytes, sha256 ${CKPT_SHA256}"
+
+WORKDIR ${COMFY_DIR}
+
+# 8188 — HTTP API ComfyUI (POST /prompt, GET /history/<id>, GET /view)
+EXPOSE 8188
+
+# Vast поднимает контейнер как есть: ComfyUI слушает наружу сразу, модели уже
+# внутри образа — ничего не докачивается на инстансе.
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch"]
