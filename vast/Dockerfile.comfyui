@@ -65,7 +65,7 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_D
     && python3 -m pip install --no-cache-dir -r "${COMFY_DIR}/requirements.txt" \
     && python3 -c "import torch; assert torch.__version__.startswith('2.11.0'), 'pip подменил torch на ' + torch.__version__; print('torch после requirements:', torch.__version__)" \
     && python3 -c "import comfy_kitchen, comfy_aimdo; print('comfy_kitchen/comfy_aimdo импортируются')" \
-    && python3 -c "import comfy.utils; print('comfy.utils импортируется')"
+    && cd "${COMFY_DIR}" && python3 -c "import comfy.utils; print('comfy.utils импортируется')"
 
 # --- канон: один файл .safetensors, sha256 и размер зафиксированы
 # Источник — Civitai-релиз v15.0 в single-file виде, поднятый на HF. Один и тот
