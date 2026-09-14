@@ -9,7 +9,7 @@
 
 | Файл | Зачем |
 |------|-------|
-| `Dockerfile.comfyui` | сборка образа (CUDA 12.4 runtime + python 3.11 + torch 2.6.0+cu124 + ComfyUI + чекпойнт) |
+| `Dockerfile.comfyui` | сборка образа (CUDA 12.8 runtime + python 3.11 + torch 2.11.0+cu128 + ComfyUI + чекпойнт) |
 | `smoke_test.py` | пост-сборочная проверка: ComfyUI поднимается, чекпойнт виден, файл сходится по sha256 и читается как SDXL |
 | `preset.json` | параметры инстанса Vast (образ, порт 8188, лимит цены/надёжности) |
 | `onstart.sh` | onstart-скрипт Vast: ждёт ComfyUI, второй процесс не поднимает |

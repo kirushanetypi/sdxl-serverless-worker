@@ -88,6 +88,8 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" != "0" ]; then
+            echo "=== состояние контейнера ==="
+            docker inspect --format 'exit={{.State.ExitCode}} error="{{.State.Error}}" oom={{.State.OOMKilled}}' comfy-smoke || true
             echo "=== хвост лога ComfyUI ==="
             docker logs --tail 200 comfy-smoke || true
             exit "$rc"

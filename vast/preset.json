@@ -9,5 +9,5 @@
   "ports": "8188:8188",
   "onstart": "/root/vast/onstart.sh",
   "checkpoint_embedded": true,
-  "note": "Образ ~14 ГБ (ComfyUI + torch cu124 + чекпойнт канона), Vast тянет его из GHCR"
+  "note": "Образ ~14 ГБ (ComfyUI + torch 2.11 cu128 + чекпойнт канона), Vast тянет его из GHCR"
 }

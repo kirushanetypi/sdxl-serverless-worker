@@ -17,7 +17,7 @@
 #     запуск задаётся CMD (python3 main.py --listen 0.0.0.0 --port 8188).
 #
 # Проверка после сборки — vast/smoke_test.py (гоняется в CI на CPU).
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 LABEL org.opencontainers.image.title="comfyui-canon" \
       org.opencontainers.image.description="ComfyUI with the embedded WAI NSFW Illustrious v1.5 canon checkpoint" \
@@ -45,18 +45,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -VV
 
-# --- torch первым и с пином: 2.6.0 = CUDA 12.4, ровно то, что в базовом образе
+# --- torch первым и с пином
+# 2.11.0 = CUDA 12.8 (совпадает с базой). ВАЖНО: torch >= 2.7 обязателен —
+# comfy-kitchen (зависимость ComfyUI) регистрирует кастомные операторы с
+# аннотацией list[int], а torch 2.6 и ниже валятся на этом в infer_schema:
+#   ValueError: infer_schema(func): Parameter kernel_size has unsupported type list[int]
+# (ровно этим падал первый черновик). Проверено в прогоне 34825020297.
 RUN python3 -m pip install --no-cache-dir \
-        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-        --index-url https://download.pytorch.org/whl/cu124 \
-    && python3 -c "import torch; assert torch.__version__.startswith('2.6.0'), torch.__version__; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+        torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && python3 -c "import torch; assert torch.__version__.startswith('2.11.0'), torch.__version__; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
 
 # --- ComfyUI: git clone + его собственные requirements
-# В requirements.txt ComfyUI torch не запинен, а уже установленный 2.6.0 это
-# требование удовлетворяет — проверяем, что pip его не подменил.
+# В requirements.txt ComfyUI torch не запинен, а уже установленный 2.11.0 это
+# требование удовлетворяет — проверяем, что pip его не подменил, и сразу
+# убеждаемся, что проблемные нативные модули импортируются (падать в сборке
+# дешевле, чем в smoke-тесте после 14 ГБ пуша).
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}" \
     && python3 -m pip install --no-cache-dir -r "${COMFY_DIR}/requirements.txt" \
-    && python3 -c "import torch; assert torch.__version__.startswith('2.6.0'), 'pip подменил torch на ' + torch.__version__; print('torch после requirements:', torch.__version__)"
+    && python3 -c "import torch; assert torch.__version__.startswith('2.11.0'), 'pip подменил torch на ' + torch.__version__; print('torch после requirements:', torch.__version__)" \
+    && python3 -c "import comfy_kitchen, comfy_aimdo; print('comfy_kitchen/comfy_aimdo импортируются')" \
+    && python3 -c "import comfy.utils; print('comfy.utils импортируется')"
 
 # --- канон: один файл .safetensors, sha256 и размер зафиксированы
 # Источник — Civitai-релиз v15.0 в single-file виде, поднятый на HF. Один и тот
